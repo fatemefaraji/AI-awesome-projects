@@ -1,0 +1,346 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import pandas as pd
+from sklearn.model_selection import train_test_split
+import tensorflow as tf
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau, TensorBoard
+import datetime
+import segmentation_models_3D as sm
+from advanced_datagen import BRATSDataGenerator
+from advanced_unet import advanced_unet_model
+import logging
+from typing import Tuple, Dict, List
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class BRATSTrainer:
+    """
+    Advanced training pipeline for 3D U-Net on BRATS 2020 dataset.
+    """
+    
+    def __init__(self, config: Dict):
+        """
+        Initialize the trainer with configuration.
+        
+        Args:
+            config: Dictionary containing training configuration
+        """
+        self.config = config
+        self.model = None
+        self.train_gen = None
+        self.val_gen = None
+        
+        # Create output directories
+        os.makedirs(config['model_save_dir'], exist_ok=True)
+        os.makedirs(config['log_dir'], exist_ok=True)
+        
+    def calculate_class_weights(self) -> np.ndarray:
+        """
+        Calculate class weights based on label distribution in training data.
+        
+        Returns:
+            Array of class weights
+        """
+        logger.info("Calculating class weights...")
+        
+        columns = ['0', '1', '2', '3']
+        df = pd.DataFrame(columns=columns)
+        train_mask_list = sorted(glob.glob(os.path.join(self.config['train_mask_dir'], '*.npy')))
+        
+        for mask_path in train_mask_list:
+            temp_mask = np.load(mask_path)
+            temp_mask = np.argmax(temp_mask, axis=3)
+            val, counts = np.unique(temp_mask, return_counts=True)
+            counts_dict = dict(zip(map(str, val), counts))
+            df = df.append(counts_dict, ignore_index=True)
+        
+        # Fill NaN values with 0 (for classes not present in some samples)
+        df = df.fillna(0)
+        
+        class_totals = df.sum()
+        total_pixels = class_totals.sum()
+        n_classes = len(class_totals)
+        
+        # Calculate weights using balanced class weighting
+        weights = (total_pixels / (n_classes * class_totals)).round(2)
+        
+        logger.info(f"Class weights: {weights.to_dict()}")
+        return weights.values
+    
+    def setup_data_generators(self):
+        """
+        Set up data generators for training and validation.
+        """
+        logger.info("Setting up data generators...")
+        
+        # Calculate class weights if needed
+        if self.config['use_class_weights']:
+            class_weights = self.calculate_class_weights()
+        else:
+            class_weights = np.ones(self.config['num_classes'])
+        
+        # Create data generators
+        self.train_gen = BRATSDataGenerator(
+            img_dir=self.config['train_img_dir'],
+            mask_dir=self.config['train_mask_dir'],
+            batch_size=self.config['batch_size'],
+            augment=True,
+            shuffle=True,
+            num_classes=self.config['num_classes'],
+            img_dim=self.config['input_shape'][:3],
+            num_channels=self.config['input_shape'][3]
+        )
+        
+        self.val_gen = BRATSDataGenerator(
+            img_dir=self.config['val_img_dir'],
+            mask_dir=self.config['val_mask_dir'],
+            batch_size=self.config['batch_size'],
+            augment=False,
+            shuffle=False,
+            num_classes=self.config['num_classes'],
+            img_dim=self.config['input_shape'][:3],
+            num_channels=self.config['input_shape'][3]
+        )
+        
+        # Visualize a sample batch
+        self.train_gen.visualize_batch()
+        
+        return class_weights
+    
+    def setup_model(self, class_weights: np.ndarray):
+        """
+        Set up and compile the 3D U-Net model.
+        
+        Args:
+            class_weights: Array of class weights for loss function
+        """
+        logger.info("Setting up 3D U-Net model...")
+        
+        # Build model
+        self.model = advanced_unet_model(
+            input_shape=self.config['input_shape'],
+            num_classes=self.config['num_classes'],
+            filters=self.config['initial_filters'],
+            dropout_rate=self.config['dropout_rate'],
+            batch_norm=self.config['batch_norm'],
+            activation=self.config['activation'],
+            deep_supervision=self.config['deep_supervision'],
+            l2_reg=self.config['l2_regularization']
+        )
+        
+        # Define loss function
+        if self.config['loss'] == 'dice_focal':
+            dice_loss = sm.losses.DiceLoss(class_weights=class_weights)
+            focal_loss = sm.losses.CategoricalFocalLoss()
+            loss = dice_loss + focal_loss
+        elif self.config['loss'] == 'dice':
+            loss = sm.losses.DiceLoss(class_weights=class_weights)
+        else:  # categorical_crossentropy
+            loss = 'categorical_crossentropy'
+        
+        # Define metrics
+        metrics = [
+            'accuracy',
+            sm.metrics.IOUScore(threshold=0.5),
+            sm.metrics.FScore(threshold=0.5)
+        ]
+        
+        # Compile model
+        optimizer = Adam(learning_rate=self.config['learning_rate'])
+        self.model.compile(
+            optimizer=optimizer,
+            loss=loss,
+            metrics=metrics
+        )
+        
+        logger.info("Model summary:")
+        self.model.summary()
+    
+    def setup_callbacks(self) -> List[tf.keras.callbacks.Callback]:
+        """
+        Set up training callbacks.
+        
+        Returns:
+            List of configured callbacks
+        """
+        logger.info("Setting up callbacks...")
+        
+        callbacks = []
+        
+        # Model checkpoint
+        model_checkpoint = ModelCheckpoint(
+            filepath=os.path.join(self.config['model_save_dir'], 'best_model.h5'),
+            monitor='val_iou_score',
+            mode='max',
+            save_best_only=True,
+            verbose=1
+        )
+        callbacks.append(model_checkpoint)
+        
+        # Early stopping
+        early_stopping = EarlyStopping(
+            monitor='val_loss',
+            patience=self.config['early_stopping_patience'],
+            restore_best_weights=True,
+            verbose=1
+        )
+        callbacks.append(early_stopping)
+        
+        # Learning rate reduction
+        reduce_lr = ReduceLROnPlateau(
+            monitor='val_loss',
+            factor=0.1,
+            patience=self.config['reduce_lr_patience'],
+            min_lr=1e-6,
+            verbose=1
+        )
+        callbacks.append(reduce_lr)
+        
+        # TensorBoard
+        log_dir = os.path.join(
+            self.config['log_dir'],
+            datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        )
+        tensorboard = TensorBoard(
+            log_dir=log_dir,
+            histogram_freq=1,
+            profile_batch=0  # Disable profiling for better performance
+        )
+        callbacks.append(tensorboard)
+        
+        return callbacks
+    
+    def train(self):
+        """
+        Run the training pipeline.
+        """
+        logger.info("Starting training pipeline...")
+        
+        # Set up data generators and get class weights
+        class_weights = self.setup_data_generators()
+        
+        # Set up model
+        self.setup_model(class_weights)
+        
+        # Set up callbacks
+        callbacks = self.setup_callbacks()
+        
+        # Calculate steps per epoch
+        steps_per_epoch = len(self.train_gen.img_list) // self.config['batch_size']
+        val_steps = len(self.val_gen.img_list) // self.config['batch_size']
+        
+        logger.info(f"Steps per epoch: {steps_per_epoch}")
+        logger.info(f"Validation steps: {val_steps}")
+        
+        # Train the model
+        history = self.model.fit(
+            self.train_gen,
+            steps_per_epoch=steps_per_epoch,
+            epochs=self.config['epochs'],
+            validation_data=self.val_gen,
+            validation_steps=val_steps,
+            callbacks=callbacks,
+            verbose=1
+        )
+        
+        # Save final model
+        final_model_path = os.path.join(self.config['model_save_dir'], 'final_model.h5')
+        self.model.save(final_model_path)
+        logger.info(f"Saved final model to {final_model_path}")
+        
+        # Plot training history
+        self.plot_history(history)
+        
+        return history
+    
+    def plot_history(self, history):
+        """
+        Plot training history metrics.
+        
+        Args:
+            history: History object returned from model.fit()
+        """
+        # Plot loss
+        plt.figure(figsize=(12, 6))
+        plt.plot(history.history['loss'], label='Training Loss')
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+        plt.title('Training and Validation Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.savefig(os.path.join(self.config['log_dir'], 'loss_plot.png'))
+        plt.close()
+        
+        # Plot IoU
+        plt.figure(figsize=(12, 6))
+        plt.plot(history.history['iou_score'], label='Training IoU')
+        plt.plot(history.history['val_iou_score'], label='Validation IoU')
+        plt.title('Training and Validation IoU Score')
+        plt.xlabel('Epoch')
+        plt.ylabel('IoU Score')
+        plt.legend()
+        plt.savefig(os.path.join(self.config['log_dir'], 'iou_plot.png'))
+        plt.close()
+        
+        # Plot accuracy
+        plt.figure(figsize=(12, 6))
+        plt.plot(history.history['accuracy'], label='Training Accuracy')
+        plt.plot(history.history['val_accuracy'], label='Validation Accuracy')
+        plt.title('Training and Validation Accuracy')
+        plt.xlabel('Epoch')
+        plt.ylabel('Accuracy')
+        plt.legend()
+        plt.savefig(os.path.join(self.config['log_dir'], 'accuracy_plot.png'))
+        plt.close()
+
+def get_default_config():
+    """
+    Return default training configuration.
+    """
+    return {
+        # Data paths
+        'train_img_dir': 'BraTS2020_TrainingData/input_data_128/train/images/',
+        'train_mask_dir': 'BraTS2020_TrainingData/input_data_128/train/masks/',
+        'val_img_dir': 'BraTS2020_TrainingData/input_data_128/val/images/',
+        'val_mask_dir': 'BraTS2020_TrainingData/input_data_128/val/masks/',
+        
+        # Model parameters
+        'input_shape': (128, 128, 128, 3),  # Height, Width, Depth, Channels
+        'num_classes': 4,
+        'initial_filters': 16,
+        'dropout_rate': 0.1,
+        'batch_norm': True,
+        'activation': 'relu',
+        'deep_supervision': False,
+        'l2_regularization': 1e-5,
+        
+        # Training parameters
+        'batch_size': 2,
+        'epochs': 100,
+        'learning_rate': 1e-4,
+        'loss': 'dice_focal',  # 'dice_focal', 'dice', or 'categorical_crossentropy'
+        'use_class_weights': True,
+        
+        # Callback parameters
+        'early_stopping_patience': 15,
+        'reduce_lr_patience': 10,
+        
+        # Output directories
+        'model_save_dir': 'saved_models',
+        'log_dir': 'logs'
+    }
+
+def main():
+    # Load configuration
+    config = get_default_config()
+    
+    # Create and run trainer
+    trainer = BRATSTrainer(config)
+    trainer.train()
+
+if __name__ == "__main__":
+    main()
