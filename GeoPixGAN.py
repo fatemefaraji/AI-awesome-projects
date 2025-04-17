@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+
 """
 GeoPixGAN: Generating Realistic Geological Images with Pix2Pix GAN
 
