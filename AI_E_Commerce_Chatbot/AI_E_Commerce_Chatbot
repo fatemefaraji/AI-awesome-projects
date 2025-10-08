@@ -1,1 +1,201 @@
 
+!pip install gradio redis pandas sentence-transformers langchain langchain_groq
+from google.colab import drive
+drive.mount('/content/drive')
+
+import numpy as np
+import pandas as pd
+import time
+import gradio as gr
+import redis
+from redis.commands.search.field import VectorField, TextField, TagField
+from redis.commands.search.query import Query
+from sentence_transformers import SentenceTransformer
+from langchain.prompts import PromptTemplate
+from langchain_groq import ChatGroq
+from langchain.chains import LLMChain
+from langchain.memory import ConversationBufferMemory
+
+# Configuration
+CONFIG = {
+    'redis_host': 'redis-14783.c15.us-east-1-2.ec2.redns.redis-cloud.com',
+    'redis_port': 14783,
+    'redis_password': "",
+    'max_text_length': 512,
+    'number_products': 1000,
+    'embedding_field': 'item_keyword_vector',
+    'embedding_dim': 768,
+    'top_k': 3
+}
+
+class EcommerceChatbot:
+    def __init__(self, config):
+        self.config = config
+        self.setup_redis()
+        self.load_model()
+        self.load_data()
+        self.setup_llm()
+        
+    def setup_redis(self):
+        self.redis_conn = redis.Redis(
+            host=self.config['redis_host'],
+            port=self.config['redis_port'],
+            decode_responses=True,
+            username="default",
+            password=self.config['redis_password'],
+        )
+    
+    def load_model(self):
+        self.model = SentenceTransformer('sentence-transformers/all-distilroberta-v1')
+    
+    def load_data(self):
+        def auto_truncate(val):
+            return val[:self.config['max_text_length']]
+        
+        all_prods_df = pd.read_csv(
+            "/content/drive/MyDrive/ecommerce/product_data.csv", 
+            converters={
+                'bullet_point': auto_truncate,
+                'item_keywords': auto_truncate,
+                'item_name': auto_truncate
+            }
+        )
+        
+        all_prods_df['primary_key'] = all_prods_df['item_id'] + '-' + all_prods_df['domain_name']
+        all_prods_df['item_keywords'].replace('', np.nan, inplace=True)
+        all_prods_df.dropna(subset=['item_keywords'], inplace=True)
+        all_prods_df.reset_index(drop=True, inplace=True)
+        
+        self.product_metadata = all_prods_df.head(self.config['number_products']).to_dict(orient='index')
+        
+        item_keywords = [self.product_metadata[i]['item_keywords'] for i in self.product_metadata.keys()]
+        self.item_keywords_vectors = [self.model.encode(sentence) for sentence in item_keywords]
+    
+    def create_flat_index(self):
+        self.redis_conn.ft().create_index([
+            VectorField(
+                self.config['embedding_field'], 
+                "FLAT", 
+                {
+                    "TYPE": "FLOAT32", 
+                    "DIM": self.config['embedding_dim'], 
+                    "DISTANCE_METRIC": "COSINE", 
+                    "INITIAL_CAP": self.config['number_products'], 
+                    "BLOCK_SIZE": self.config['number_products']
+                }
+            ),
+            TagField("product_type"),
+            TextField("item_name"),
+            TextField("item_keywords"),
+            TagField("country")
+        ])
+    
+    def load_vectors(self):
+        p = self.redis_conn.pipeline(transaction=False)
+        for index in self.product_metadata.keys():
+            key = f"product:{index}:{self.product_metadata[index]['primary_key']}"
+            item_metadata = self.product_metadata[index].copy()
+            item_metadata[self.config['embedding_field']] = self.item_keywords_vectors[index].astype(np.float32).tobytes()
+            p.hset(key, mapping=item_metadata)
+        p.execute()
+    
+    def setup_llm(self):
+        self.llm = ChatGroq(
+            model="llama-3.3-70b-versatile",
+            temperature=0,
+            api_key=""
+        )
+        
+        self.keyword_prompt = PromptTemplate(
+            input_variables=["product_description"],
+            template="Create comma separated product keywords to perform a query on a amazon dataset for this user input: {product_description}",
+        )
+        
+        self.keyword_chain = LLMChain(llm=self.llm, prompt=self.keyword_prompt)
+        
+        self.chat_prompt = PromptTemplate(
+            input_variables=["chat_history", "user_msg"],
+            template="""You are a helpful e-commerce chatbot. Use the provided context to answer the user's question clearly and concisely.
+
+{chat_history}
+Human: {user_msg}
+Chatbot:"""
+        )
+        
+        self.memory = ConversationBufferMemory(memory_key="chat_history")
+        self.chat_chain = LLMChain(
+            llm=self.llm,
+            prompt=self.chat_prompt,
+            memory=self.memory,
+            verbose=False
+        )
+    
+    def initialize_database(self):
+        self.redis_conn.flushall()
+        self.create_flat_index()
+        self.load_vectors()
+        print(f"Loaded and indexed {self.config['number_products']} products")
+    
+    def search_products(self, query_text):
+        keywords = self.keyword_chain.run(query_text)
+        query_vector = self.model.encode(keywords).astype(np.float32).tobytes()
+        
+        q = Query(f'*=>[KNN {self.config["top_k"]} @{self.config["embedding_field"]} $vec_param AS vector_score]'
+                 ).sort_by('vector_score').paging(0, self.config['top_k']).return_fields(
+                 'vector_score', 'item_name', 'item_id', 'item_keywords').dialect(2)
+        
+        results = self.redis_conn.ft().search(q, query_params={"vec_param": query_vector})
+        
+        full_result = ''
+        for product in results.docs:
+            full_result += f"{product.item_name} - {product.item_keywords} (ID: {product.item_id})\n\n"
+        
+        return full_result
+    
+    def get_response(self, user_input):
+        search_results = self.search_products(user_input)
+        context = f"Search Results:\n{search_results}\nUser Question: {user_input}"
+        response = self.chat_chain.predict(user_msg=context)
+        return response
+    
+    def chat_interface(self, history, user_input):
+        if user_input.strip():
+            bot_response = self.get_response(user_input)
+            history.append((user_input, bot_response))
+        return history, ""
+
+def main():
+    chatbot = EcommerceChatbot(CONFIG)
+    chatbot.initialize_database()
+    
+    with gr.Blocks(title="AI E-commerce Assistant") as demo:
+        gr.Markdown("# 🛍️ AI E-commerce Chatbot")
+        gr.Markdown("Find products and get recommendations using natural language.")
+        
+        with gr.Row():
+            chatbot_interface = gr.Chatbot(height=500)
+        
+        with gr.Row():
+            user_input = gr.Textbox(
+                placeholder="Describe what you're looking for...",
+                label="Your Message",
+                scale=4
+            )
+            send_btn = gr.Button("Send", variant="primary", scale=1)
+        
+        send_btn.click(
+            chatbot.chat_interface,
+            inputs=[chatbot_interface, user_input],
+            outputs=[chatbot_interface, user_input]
+        )
+        
+        user_input.submit(
+            chatbot.chat_interface,
+            inputs=[chatbot_interface, user_input],
+            outputs=[chatbot_interface, user_input]
+        )
+    
+    demo.launch(share=True)
+
+if __name__ == "__main__":
+    main()
