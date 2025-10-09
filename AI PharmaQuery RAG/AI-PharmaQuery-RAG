@@ -1,185 +1,195 @@
-!pip install langchain_chroma langchain_groq langchain_core langchain_community langchain_text_splitters pypdf
-import os
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
-
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters.sentence_transformers import SentenceTransformersTokenTextSplitter
-from langchain_chroma import Chroma
-# Create directory for persistent DB
-os.makedirs("pharma_db", exist_ok=True)
-# Initialize embedding model and vector DB
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-db = Chroma(collection_name="pharma_database", embedding_function=embedding_model, persist_directory="./pharma_db")
-# Prompt template
-PROMPT_TEMPLATE = """
-You are a highly knowledgeable assistant specializing in pharmaceutical sciences.
-Answer the question based only on the following context:
-{context}
-
-Answer the question based on the above context:
-{question}
-
-Use the provided context to answer the user's question accurately and concisely.
-Don't justify your answers.
-Don't give information not mentioned in the CONTEXT INFORMATION.
-Do not say "according to the context" or "mentioned in the context" or similar.
-"""
-prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-output_parser = StrOutputParser()
-# Helper function to format retrieved documents
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
-# Function to process uploaded PDF files
-def process_documents(file_paths):
-    for file_path in file_paths:
-        loader = PyPDFLoader(file_path)
-        data = loader.load()
-
-        doc_metadata = [doc.metadata for doc in data]
-        doc_content = [doc.page_content for doc in data]
-
-        text_splitter = SentenceTransformersTokenTextSplitter(
-            model_name="sentence-transformers/all-mpnet-base-v2",
-            chunk_size=100,
-            chunk_overlap=50
-        )
-        chunks = text_splitter.create_documents(doc_content, doc_metadata)
-        db.add_documents(chunks)
-
-    return "✅ Documents processed and added to database."
-# Function to query using RAG
-def run_query(query, groq_api_key):
-    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 5})
-
-    llm = ChatGroq(
-        model="llama-3.3-70b-versatile",
-        api_key=groq_api_key,
-        temperature=1
-    )
-
-    rag_chain = {
-        "context": retriever | format_docs,
-        "question": RunnablePassthrough()
-    } | prompt_template | llm | output_parser
-
-    result = rag_chain.invoke(query)
-    return result
-# Example usage
-if __name__ == "__main__":
-    # Optional: Process some PDF files first
-    pdf_paths = ["/content/AI_in_Drug_Discovery.pdf", "/content/Vaccine_Development_Workflow.pdf"]
-    process_documents(pdf_paths)
-
-    # Run a query
-    groq_api_key = ""
-    user_query = "What are the AI applications in drug discovery?"
-    answer = run_query(user_query, groq_api_key)
-    print("Answer:", answer)
-!pip install gradio
-
 import os
 import gradio as gr
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
-
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters.sentence_transformers import SentenceTransformersTokenTextSplitter
 from langchain_chroma import Chroma
 
-# Create necessary folder for persistent DB
-os.makedirs("pharma_db", exist_ok=True)
-
-# Initialize HuggingFace embedding model and Chroma vector DB
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-mpnet-base-v2")
-db = Chroma(collection_name="pharma_database", embedding_function=embedding_model, persist_directory="./pharma_db")
-
-# RAG prompt template
-PROMPT_TEMPLATE = """
+class PharmaRAGSystem:
+    def __init__(self, persist_directory="./pharma_db"):
+        """Initialize the Pharma RAG system with vector database and components."""
+        self.persist_directory = persist_directory
+        os.makedirs(self.persist_directory, exist_ok=True)
+        
+        # Initialize embedding model and vector database
+        self.embedding_model = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-mpnet-base-v2"
+        )
+        self.db = Chroma(
+            collection_name="pharma_database",
+            embedding_function=self.embedding_model,
+            persist_directory=self.persist_directory
+        )
+        
+        # Define prompt template
+        self.PROMPT_TEMPLATE = """
 You are a highly knowledgeable assistant specializing in pharmaceutical sciences.
 Answer the question based only on the following context:
+
 {context}
 
-Answer the question based on the above context:
-{question}
+Question: {question}
 
-Use the provided context to answer the user's question accurately and concisely.
-Don't justify your answers.
-Don't give information not mentioned in the CONTEXT INFORMATION.
-Do not say "according to the context" or "mentioned in the context" or similar.
+Instructions:
+- Use the provided context to answer accurately and concisely
+- Don't justify your answers
+- Don't give information not mentioned in the context
+- Do not say "according to the context" or similar phrases
+- Provide clear, factual answers based solely on the given information
 """
-prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-output_parser = StrOutputParser()
+        self.prompt_template = ChatPromptTemplate.from_template(self.PROMPT_TEMPLATE)
+        self.output_parser = StrOutputParser()
 
-# Format retrieved documents
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+    def format_docs(self, docs):
+        """Format retrieved documents into a single string."""
+        return "\n\n".join(doc.page_content for doc in docs)
 
-# Process uploaded PDF documents
-def process_documents(files):
-    for file_path in files:
-        # Each file is already saved to disk by Gradio
-        loader = PyPDFLoader(file_path)
-        data = loader.load()
+    def process_documents(self, file_paths):
+        """Process and chunk PDF documents into the vector database."""
+        if not file_paths:
+            return "No documents to process."
+        
+        all_chunks = []
+        for file_path in file_paths:
+            try:
+                loader = PyPDFLoader(file_path)
+                documents = loader.load()
+                
+                # Extract metadata and content
+                doc_metadata = [doc.metadata for doc in documents]
+                doc_content = [doc.page_content for doc in documents]
+                
+                # Split documents into chunks
+                text_splitter = SentenceTransformersTokenTextSplitter(
+                    model_name="sentence-transformers/all-mpnet-base-v2",
+                    chunk_size=500,  # Increased for better context
+                    chunk_overlap=100
+                )
+                chunks = text_splitter.create_documents(doc_content, doc_metadata)
+                all_chunks.extend(chunks)
+                
+            except Exception as e:
+                return f"❌ Error processing {file_path}: {str(e)}"
+        
+        # Add all chunks to the database
+        if all_chunks:
+            self.db.add_documents(all_chunks)
+            return f"✅ Successfully processed {len(file_paths)} document(s) and added {len(all_chunks)} chunks to database."
+        else:
+            return "❌ No valid content found in the documents."
 
-        doc_metadata = [doc.metadata for doc in data]
-        doc_content = [doc.page_content for doc in data]
+    def run_query(self, query, groq_api_key):
+        """Execute a query using the RAG pipeline."""
+        if not query.strip():
+            return "Please enter a valid question."
+        
+        if not groq_api_key.strip():
+            return "Please provide your Groq API key."
+        
+        try:
+            # Initialize retriever
+            retriever = self.db.as_retriever(
+                search_type="similarity", 
+                search_kwargs={"k": 5}
+            )
+            
+            # Initialize LLM
+            llm = ChatGroq(
+                model="llama-3.3-70b-versatile",
+                api_key=groq_api_key,
+                temperature=0.3  # Lower temperature for more factual responses
+            )
+            
+            # Create RAG chain
+            rag_chain = (
+                {
+                    "context": retriever | self.format_docs,
+                    "question": RunnablePassthrough()
+                } 
+                | self.prompt_template 
+                | llm 
+                | self.output_parser
+            )
+            
+            # Execute query
+            result = rag_chain.invoke(query)
+            return result
+            
+        except Exception as e:
+            return f"❌ Error processing query: {str(e)}"
 
-        text_splitter = SentenceTransformersTokenTextSplitter(
-            model_name="sentence-transformers/all-mpnet-base-v2",
-            chunk_size=100,
-            chunk_overlap=50
-        )
-        chunks = text_splitter.create_documents(doc_content, doc_metadata)
-        db.add_documents(chunks)
-
-    return "✅ Documents processed and added to database."
-
-# Run query through RAG chain
-def run_query(query, groq_api_key):
-    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 5})
-
-    llm = ChatGroq(
-        model="llama3-70b-8192",
-        api_key=groq_api_key,
-        temperature=1
+def main():
+    """Main function to initialize and run the Pharma RAG system."""
+    
+    # Initialize the RAG system
+    rag_system = PharmaRAGSystem()
+    
+    def gradio_interface(query, groq_api_key, files):
+        """Gradio interface function."""
+        file_paths = []
+        
+        # Process uploaded files if any
+        if files:
+            file_paths = [file.name for file in files]
+            processing_result = rag_system.process_documents(file_paths)
+            print(processing_result)  # Log processing result
+        
+        # Run query
+        if query and groq_api_key:
+            return rag_system.run_query(query, groq_api_key)
+        elif not query:
+            return "Please enter a pharmaceutical question."
+        else:
+            return "Please provide your Groq API key."
+    
+    # Create Gradio interface
+    iface = gr.Interface(
+        fn=gradio_interface,
+        inputs=[
+            gr.Textbox(
+                label="Pharmaceutical Question",
+                placeholder="e.g., What are the AI applications in drug discovery?",
+                lines=3
+            ),
+            gr.Textbox(
+                label="Groq API Key",
+                type="password",
+                placeholder="Enter your Groq API key here..."
+            ),
+            gr.File(
+                label="Upload PDF Documents (Optional)",
+                file_types=[".pdf"],
+                file_count="multiple",
+                type="filepath"
+            )
+        ],
+        outputs=gr.Textbox(
+            label="RAG Answer",
+            lines=10,
+            show_copy_button=True
+        ),
+        title="💊 PharmaQuery - RAG System for Pharmaceutical Sciences",
+        description="""
+        Upload pharmaceutical research PDFs and ask questions using advanced RAG technology.
+        Powered by Groq's LLaMA 3.3 and HuggingFace embeddings.
+        """,
+        examples=[
+            ["What are the main stages of clinical trials?", ""],
+            ["How does AI help in drug discovery?", ""],
+            ["What are the challenges in vaccine development?", ""]
+        ]
+    )
+    
+    # Launch the application
+    iface.launch(
+        share=False,
+        server_name="0.0.0.0",
+        server_port=7860
     )
 
-    rag_chain = {
-        "context": retriever | format_docs,
-        "question": RunnablePassthrough()
-    } | prompt_template | llm | output_parser
-
-    result = rag_chain.invoke(query)
-    return result
-
-# Main Gradio interface function
-def pharma_query_interface(query, groq_api_key, files):
-    if files:
-        process_documents(files)
-    if not query or not groq_api_key:
-        return "⚠️ Please enter a query and your GROQ API key."
-    return run_query(query, groq_api_key)
-
-# Gradio UI
-iface = gr.Interface(
-    fn=pharma_query_interface,
-    inputs=[
-        gr.Textbox(label="Pharmaceutical Question", placeholder="e.g., What are the AI applications in drug discovery?"),
-        gr.Textbox(label="Groq API Key", type="password"),
-        gr.File(label="Upload PDF documents (optional)", file_types=[".pdf"], file_count="multiple")
-    ],
-    outputs=gr.Textbox(label="RAG Answer", lines=10),
-    title="💊 PharmaQuery - RAG for Pharmaceutical Sciences",
-    description="Upload pharmaceutical research PDFs and ask questions using Groq's LLaMA3 and HuggingFace embeddings."
-)
-
-# Launch the Gradio app
 if __name__ == "__main__":
-    iface.launch()
+    main()
