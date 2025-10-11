@@ -1,4 +1,6 @@
 import os
+import logging
+from typing import List, Optional
 import gradio as gr
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
@@ -9,21 +11,40 @@ from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters.sentence_transformers import SentenceTransformersTokenTextSplitter
 from langchain_chroma import Chroma
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 class PharmaRAGSystem:
-    def __init__(self, persist_directory="./pharma_db"):
-        """Initialize the Pharma RAG system with vector database and components."""
+    def __init__(self, persist_directory: str = "./pharma_db", config: dict = None):
+        """
+        Initialize the Pharma RAG system with vector database and components.
+        
+        Args:
+            persist_directory (str): Directory to persist the Chroma DB.
+            config (dict, optional): Configuration dictionary for customizable parameters.
+        """
         self.persist_directory = persist_directory
+        self.config = config or {
+            "embedding_model": "sentence-transformers/all-mpnet-base-v2",
+            "chunk_size": 500,
+            "chunk_overlap": 100,
+            "retriever_k": 5,
+            "llm_model": "llama3-70b-8192",  # Updated to a standard Groq model name
+            "temperature": 0.3
+        }
         os.makedirs(self.persist_directory, exist_ok=True)
         
         # Initialize embedding model and vector database
-        self.embedding_model = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-mpnet-base-v2"
-        )
+        self.embedding_model = HuggingFaceEmbeddings(model_name=self.config["embedding_model"])
         self.db = Chroma(
             collection_name="pharma_database",
             embedding_function=self.embedding_model,
             persist_directory=self.persist_directory
         )
+        
+        # LLM will be initialized lazily in run_query to handle API key dynamically
+        self.llm = None
         
         # Define prompt template
         self.PROMPT_TEMPLATE = """
@@ -44,20 +65,38 @@ Instructions:
         self.prompt_template = ChatPromptTemplate.from_template(self.PROMPT_TEMPLATE)
         self.output_parser = StrOutputParser()
 
-    def format_docs(self, docs):
+    def format_docs(self, docs: List) -> str:
         """Format retrieved documents into a single string."""
         return "\n\n".join(doc.page_content for doc in docs)
 
-    def process_documents(self, file_paths):
-        """Process and chunk PDF documents into the vector database."""
+    def process_documents(self, file_paths: List[str]) -> str:
+        """
+        Process and chunk PDF documents into the vector database.
+        
+        Args:
+            file_paths (List[str]): List of paths to PDF files.
+            
+        Returns:
+            str: Status message indicating success or failure.
+        """
         if not file_paths:
-            return "No documents to process."
+            return "ℹ️ No documents provided for processing."
         
         all_chunks = []
+        errors = []
+        
         for file_path in file_paths:
+            if not os.path.exists(file_path) or not file_path.lower().endswith('.pdf'):
+                errors.append(f"Invalid file: {file_path}")
+                continue
+                
             try:
                 loader = PyPDFLoader(file_path)
                 documents = loader.load()
+                
+                if not documents:
+                    errors.append(f"No content found in {file_path}")
+                    continue
                 
                 # Extract metadata and content
                 doc_metadata = [doc.metadata for doc in documents]
@@ -65,44 +104,75 @@ Instructions:
                 
                 # Split documents into chunks
                 text_splitter = SentenceTransformersTokenTextSplitter(
-                    model_name="sentence-transformers/all-mpnet-base-v2",
-                    chunk_size=500,  # Increased for better context
-                    chunk_overlap=100
+                    model_name=self.config["embedding_model"],
+                    chunk_size=self.config["chunk_size"],
+                    chunk_overlap=self.config["chunk_overlap"]
                 )
                 chunks = text_splitter.create_documents(doc_content, doc_metadata)
                 all_chunks.extend(chunks)
+                logger.info(f"Processed {len(chunks)} chunks from {file_path}")
                 
             except Exception as e:
-                return f"❌ Error processing {file_path}: {str(e)}"
+                error_msg = f"Error processing {file_path}: {str(e)}"
+                errors.append(error_msg)
+                logger.error(error_msg)
         
-        # Add all chunks to the database
+        # Add all chunks to the database if any
         if all_chunks:
             self.db.add_documents(all_chunks)
-            return f"✅ Successfully processed {len(file_paths)} document(s) and added {len(all_chunks)} chunks to database."
+            success_msg = f"✅ Successfully added {len(all_chunks)} chunks from {len(file_paths) - len(errors)} documents."
+            logger.info(success_msg)
+            
+            if errors:
+                return f"{success_msg}\n⚠️ Warnings: {'; '.join(errors)}"
+            return success_msg
         else:
-            return "❌ No valid content found in the documents."
+            error_msg = "❌ No valid content found in the documents."
+            if errors:
+                error_msg += f"\nErrors: {'; '.join(errors)}"
+            logger.warning(error_msg)
+            return error_msg
 
-    def run_query(self, query, groq_api_key):
-        """Execute a query using the RAG pipeline."""
-        if not query.strip():
-            return "Please enter a valid question."
+    def _get_llm(self, groq_api_key: str) -> ChatGroq:
+        """Lazily initialize and return the LLM."""
+        if self.llm is None or self.llm.api_key != groq_api_key:
+            self.llm = ChatGroq(
+                model=self.config["llm_model"],
+                api_key=groq_api_key,
+                temperature=self.config["temperature"]
+            )
+        return self.llm
+
+    def run_query(self, query: str, groq_api_key: str) -> str:
+        """
+        Execute a query using the RAG pipeline.
         
-        if not groq_api_key.strip():
-            return "Please provide your Groq API key."
+        Args:
+            query (str): The question to answer.
+            groq_api_key (str): Groq API key.
+            
+        Returns:
+            str: The answer or error message.
+        """
+        if not query or not query.strip():
+            return "❌ Please enter a valid question."
+        
+        if not groq_api_key or not groq_api_key.strip():
+            return "❌ Please provide your Groq API key."
         
         try:
+            # Check if DB has documents
+            if self.db._collection.count() == 0:
+                return "ℹ️ No documents loaded in the database. Please upload and process PDFs first."
+            
             # Initialize retriever
             retriever = self.db.as_retriever(
                 search_type="similarity", 
-                search_kwargs={"k": 5}
+                search_kwargs={"k": self.config["retriever_k"]}
             )
             
-            # Initialize LLM
-            llm = ChatGroq(
-                model="llama-3.3-70b-versatile",
-                api_key=groq_api_key,
-                temperature=0.3  # Lower temperature for more factual responses
-            )
+            # Get LLM
+            llm = self._get_llm(groq_api_key)
             
             # Create RAG chain
             rag_chain = (
@@ -117,79 +187,111 @@ Instructions:
             
             # Execute query
             result = rag_chain.invoke(query)
+            logger.info(f"Query executed successfully: {query[:50]}...")
             return result
             
         except Exception as e:
-            return f"❌ Error processing query: {str(e)}"
+            error_msg = f"❌ Error processing query: {str(e)}"
+            logger.error(error_msg)
+            return error_msg
 
-def main():
-    """Main function to initialize and run the Pharma RAG system."""
+
+def create_gradio_interface(rag_system: PharmaRAGSystem):
+    """Create and configure the Gradio interface."""
     
-    # Initialize the RAG system
-    rag_system = PharmaRAGSystem()
-    
-    def gradio_interface(query, groq_api_key, files):
-        """Gradio interface function."""
-        file_paths = []
+    def gradio_interface(query: str, groq_api_key: str, files: Optional[List]):
+        """Handle Gradio inputs and return status and answer."""
+        status_msg = ""
+        answer = ""
         
         # Process uploaded files if any
         if files:
-            file_paths = [file.name for file in files]
-            processing_result = rag_system.process_documents(file_paths)
-            print(processing_result)  # Log processing result
+            file_paths = [f.name for f in files]
+            status_msg = rag_system.process_documents(file_paths)
         
-        # Run query
+        # Run query if provided
         if query and groq_api_key:
-            return rag_system.run_query(query, groq_api_key)
-        elif not query:
-            return "Please enter a pharmaceutical question."
-        else:
-            return "Please provide your Groq API key."
+            answer = rag_system.run_query(query, groq_api_key)
+            if status_msg:
+                status_msg += "\n\n"
+        elif query:
+            answer = "ℹ️ Please provide your Groq API key to run the query."
+        elif not files:
+            status_msg = "ℹ️ Upload PDFs and/or enter a question to get started."
+        
+        return status_msg, answer
     
-    # Create Gradio interface
-    iface = gr.Interface(
-        fn=gradio_interface,
-        inputs=[
-            gr.Textbox(
-                label="Pharmaceutical Question",
-                placeholder="e.g., What are the AI applications in drug discovery?",
-                lines=3
-            ),
-            gr.Textbox(
-                label="Groq API Key",
-                type="password",
-                placeholder="Enter your Groq API key here..."
-            ),
-            gr.File(
-                label="Upload PDF Documents (Optional)",
-                file_types=[".pdf"],
-                file_count="multiple",
-                type="filepath"
-            )
-        ],
-        outputs=gr.Textbox(
-            label="RAG Answer",
-            lines=10,
-            show_copy_button=True
-        ),
-        title="💊 PharmaQuery - RAG System for Pharmaceutical Sciences",
-        description="""
-        Upload pharmaceutical research PDFs and ask questions using advanced RAG technology.
-        Powered by Groq's LLaMA 3.3 and HuggingFace embeddings.
-        """,
-        examples=[
-            ["What are the main stages of clinical trials?", ""],
-            ["How does AI help in drug discovery?", ""],
-            ["What are the challenges in vaccine development?", ""]
-        ]
-    )
+    # Create Gradio interface with multiple outputs
+    with gr.Blocks(theme=gr.themes.Soft()) as iface:
+        gr.Markdown("# 💊 PharmaQuery - RAG System for Pharmaceutical Sciences")
+        gr.Markdown("""
+        Upload pharmaceutical research PDFs and ask questions using advanced RAG technology.  
+        Powered by Groq's LLaMA and HuggingFace embeddings.  
+        """)
+        
+        with gr.Row():
+            with gr.Column(scale=2):
+                question_input = gr.Textbox(
+                    label="Pharmaceutical Question",
+                    placeholder="e.g., What are the main stages of clinical trials?",
+                    lines=3
+                )
+                api_key_input = gr.Textbox(
+                    label="Groq API Key",
+                    type="password",
+                    placeholder="Enter your Groq API key here..."
+                )
+                file_input = gr.File(
+                    label="Upload PDF Documents (Optional)",
+                    file_types=[".pdf"],
+                    file_count="multiple"
+                )
+            with gr.Column(scale=3):
+                status_output = gr.Textbox(
+                    label="Processing Status",
+                    lines=4,
+                    interactive=False
+                )
+                answer_output = gr.Textbox(
+                    label="RAG Answer",
+                    lines=10,
+                    show_copy_button=True,
+                    interactive=False
+                )
+        
+        submit_btn = gr.Button("Submit", variant="primary")
+        submit_btn.click(
+            fn=gradio_interface,
+            inputs=[question_input, api_key_input, file_input],
+            outputs=[status_output, answer_output]
+        )
+        
+        gr.Examples(
+            examples=[
+                [ "What are the main stages of clinical trials?", "your_api_key_here", None ],
+                [ "How does AI help in drug discovery?", "your_api_key_here", None ],
+                [ "What are the challenges in vaccine development?", "your_api_key_here", None ]
+            ],
+            inputs=[question_input, api_key_input, file_input]
+        )
     
-    # Launch the application
+    return iface
+
+
+def main():
+    """Main function to initialize and run the Pharma RAG system."""
+    # Initialize the RAG system
+    rag_system = PharmaRAGSystem()
+    
+    # Create and launch Gradio interface
+    iface = create_gradio_interface(rag_system)
     iface.launch(
         share=False,
         server_name="0.0.0.0",
-        server_port=7860
+        server_port=7860,
+        debug=False
     )
+
 
 if __name__ == "__main__":
     main()
