@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card">
+            <div class="card-body">
+                <h2 class="card-title text-center mb-4">AI Learning Assistant</h2>
+                
+                {% if error %}
+                <div class="alert alert-danger" role="alert">
+                    {{ error }}
+                </div>
+                {% endif %}
+
+                <form method="POST">
+                    <div class="mb-3">
+                        <label for="topic" class="form-label">What would you like to learn?</label>
+                        <input type="text" 
+                               class="form-control form-control-lg" 
+                               id="topic" 
+                               name="topic" 
+                               value="{{ topic or '' }}"
+                               placeholder="Enter a topic (e.g., Machine Learning, Web Development, Python Programming)..."
+                               required>
+                        <div class="form-text">Enter any topic you'd like to learn about.</div>
+                    </div>
+                    
+                    <div class="d-grid">
+                        <button type="submit" class="btn btn-primary btn-lg">Generate Learning Plan</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        {% if responses %}
+        <div class="mt-5">
+            <h3 class="text-center mb-4">Your Learning Plan for "{{ topic }}"</h3>
+            
+            {% for role, response in responses.items() %}
+            <div class="card agent-card mb-4">
+                <div class="card-header d-flex align-items-center">
+                    <span class="fs-4 me-2">{{ response.icon }}</span>
+                    <h5 class="card-title mb-0">{{ response.name }}</h5>
+                </div>
+                <div class="card-body">
+                    {% if response.error %}
+                    <div class="alert alert-warning">
+                        {{ response.content }}
+                    </div>
+                    {% else %}
+                    <div class="agent-content">
+                        {{ response.content|safe }}
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
