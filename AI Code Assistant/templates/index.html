@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Groq Code Assistant</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body class="bg-gradient-to-br from-blue-50 via-indigo-50 to-purple-50 min-h-screen text-gray-800 font-sans">
+  <div class="max-w-4xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
+    <!-- Header -->
+    <div class="text-center mb-12">
+      <h1 class="text-5xl font-bold bg-gradient-to-r from-indigo-600 to-purple-600 bg-clip-text text-transparent mb-4">
+        <i class="fas fa-robot mr-3"></i>Groq Code Assistant
+      </h1>
+      <p class="text-xl text-gray-600 max-w-2xl mx-auto">
+        Upload an image of your coding problem or describe it in text to get AI-generated Python solutions with live execution.
+      </p>
+    </div>
+
+    <!-- Main Card -->
+    <div class="bg-white rounded-3xl shadow-2xl border border-gray-200 overflow-hidden">
+      <div class="p-8">
+        <form method="POST" enctype="multipart/form-data" class="space-y-8" id="codeForm">
+          <!-- Image Upload Section -->
+          <div class="space-y-4">
+            <label class="block text-lg font-semibold text-gray-800">
+              <i class="fas fa-image text-indigo-500 mr-2"></i>Upload Coding Problem Image
+            </label>
+            <div class="border-2 border-dashed border-gray-300 rounded-2xl p-6 text-center hover:border-indigo-400 transition-colors duration-300">
+              <input type="file" name="image" accept="image/*" class="hidden" id="imageInput">
+              <div class="space-y-3">
+                <i class="fas fa-cloud-upload-alt text-3xl text-gray-400"></i>
+                <div>
+                  <button type="button" onclick="document.getElementById('imageInput').click()" 
+                          class="bg-indigo-500 text-white px-6 py-2 rounded-lg font-semibold hover:bg-indigo-600 transition-colors duration-300">
+                    Choose Image
+                  </button>
+                </div>
+                <p class="text-sm text-gray-500">PNG, JPG, GIF up to 10MB</p>
+                <p id="fileName" class="text-sm font-medium text-indigo-600 hidden"></p>
+              </div>
+            </div>
+          </div>
+
+          <!-- Divider -->
+          <div class="relative">
+            <div class="absolute inset-0 flex items-center">
+              <div class="w-full border-t border-gray-300"></div>
+            </div>
+            <div class="relative flex justify-center text-sm">
+              <span class="px-4 bg-white text-gray-500">OR</span>
+            </div>
+          </div>
+
+          <!-- Text Input Section -->
+          <div class="space-y-4">
+            <label class="block text-lg font-semibold text-gray-800">
+              <i class="fas fa-keyboard text-purple-500 mr-2"></i>Describe Your Coding Problem
+            </label>
+            <textarea name="query" rows="5" 
+                      class="w-full p-4 border border-gray-300 rounded-xl shadow-sm focus:ring-2 focus:ring-indigo-400 focus:border-indigo-400 focus:outline-none transition-all duration-300 resize-none"
+                      placeholder="Describe your coding problem here...&#10;Example: Write a Python function to find the longest palindrome in a string"></textarea>
+          </div>
+
+          <!-- Submit Button -->
+          <button type="submit" 
+                  class="w-full bg-gradient-to-r from-indigo-500 to-purple-600 text-white py-4 rounded-xl text-lg font-semibold shadow-lg hover:from-indigo-600 hover:to-purple-700 transform hover:scale-[1.02] transition-all duration-300 flex items-center justify-center space-x-2">
+            <i class="fas fa-bolt"></i>
+            <span>Generate & Execute Code</span>
+          </button>
+        </form>
+
+        <!-- Loading Spinner -->
+        <div id="loadingSpinner" class="hidden mt-8 text-center">
+          <div class="inline-flex items-center space-x-3 bg-blue-50 px-6 py-4 rounded-xl">
+            <div class="animate-spin rounded-full h-6 w-6 border-b-2 border-indigo-600"></div>
+            <span class="text-indigo-700 font-medium">Generating and executing code...</span>
+          </div>
+        </div>
+
+        <!-- Error Display -->
+        {% if error %}
+        <div class="mt-8 bg-red-50 border border-red-200 rounded-xl p-6">
+          <div class="flex items-center space-x-3">
+            <i class="fas fa-exclamation-triangle text-red-500 text-xl"></i>
+            <h3 class="text-lg font-semibold text-red-800">Error</h3>
+          </div>
+          <p class="mt-2 text-red-700">{{ error }}</p>
+        </div>
+        {% endif %}
+
+        <!-- Extracted Problem -->
+        {% if extracted %}
+        <div class="mt-8">
+          <h2 class="text-2xl font-bold text-purple-700 mb-4 flex items-center">
+            <i class="fas fa-file-alt mr-2"></i>Extracted Problem
+          </h2>
+          <div class="bg-yellow-50 border-l-4 border-yellow-400 p-6 rounded-xl">
+            <pre class="text-gray-800 whitespace-pre-wrap font-sans">{{ extracted }}</pre>
+          </div>
+        </div>
+        {% endif %}
+
+        <!-- Solution -->
+        {% if solution %}
+        <div class="mt-8">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-2xl font-bold text-green-700 flex items-center">
+              <i class="fas fa-code mr-2"></i>Generated Solution
+            </h2>
+            <button onclick="copyToClipboard('{{ solution | replace('\n', '\\n') | replace("'", "\\'") }}')" 
+                    class="bg-green-500 text-white px-4 py-2 rounded-lg text-sm font-medium hover:bg-green-600 transition-colors duration-300 flex items-center space-x-2">
+              <i class="fas fa-copy"></i>
+              <span>Copy Code</span>
+            </button>
+          </div>
+          <div class="bg-gray-900 rounded-xl p-6 font-mono text-sm overflow-x-auto shadow-inner">
+            <pre class="text-green-400 whitespace-pre-wrap"><code>{{ solution }}</code></pre>
+          </div>
+        </div>
+        {% endif %}
+
+        <!-- Execution Results -->
+        {% if result %}
+        <div class="mt-8">
+          <h2 class="text-2xl font-bold text-blue-700 mb-4 flex items-center">
+            <i class="fas fa-play-circle mr-2"></i>Execution Results
+          </h2>
+          {{ result|safe }}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <div class="text-center mt-8 text-gray-600">
+      <p>Powered by Groq AI and E2B Code Interpreter</p>
+    </div>
+  </div>
+
+  <script>
+    // File input handling
+    document.getElementById('imageInput').addEventListener('change', function(e) {
+      const fileName = e.target.files[0]?.name;
+      const fileNameElement = document.getElementById('fileName');
+      
+      if (fileName) {
+        fileNameElement.textContent = `Selected: ${fileName}`;
+        fileNameElement.classList.remove('hidden');
+        
+        // Clear textarea
+        document.querySelector('textarea[name="query"]').value = '';
+      } else {
+        fileNameElement.classList.add('hidden');
+      }
+    });
+
+    // Textarea input handling
+    document.querySelector('textarea[name="query"]').addEventListener('input', function(e) {
+      if (e.target.value.trim()) {
+        // Clear file input
+        document.getElementById('imageInput').value = '';
+        document.getElementById('fileName').classList.add('hidden');
+      }
+    });
+
+    // Form submission loading
+    document.getElementById('codeForm').addEventListener('submit', function() {
+      document.getElementById('loadingSpinner').classList.remove('hidden');
+    });
+
+    // Copy to clipboard function
+    function copyToClipboard(text) {
+      navigator.clipboard.writeText(text).then(function() {
+        // Show success message
+        const button = event.target.closest('button');
+        const originalHtml = button.innerHTML;
+        button.innerHTML = '<i class="fas fa-check"></i><span>Copied!</span>';
+        button.classList.remove('bg-green-500', 'hover:bg-green-600');
+        button.classList.add('bg-green-600');
+        
+        setTimeout(() => {
+          button.innerHTML = originalHtml;
+          button.classList.remove('bg-green-600');
+          button.classList.add('bg-green-500', 'hover:bg-green-600');
+        }, 2000);
+      }).catch(function(err) {
+        console.error('Failed to copy: ', err);
+      });
+    }
+  </script>
+</body>
+</html>
