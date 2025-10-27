@@ -1,239 +1,279 @@
-from flask import Flask, render_template, request, session, flash, redirect, url_for
-import pandas as pd
-from groq import Groq
 import os
 import logging
-from typing import Tuple, Optional, Dict, Any
-import io
-from utils import preprocess_and_save
+import time
+import uuid
+from flask import Flask, request, render_template, jsonify, session
+from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
+from dotenv import load_dotenv
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-key-please-change")
+from utils.image_processor import ImageProcessor
+from utils.code_generator import CodeGenerator
+from utils.code_executor import CodeExecutor
 
-# Configuration
-app.config.update(
-    MAX_CONTENT_LENGTH=16 * 1024 * 1024,  # 16MB max file size
-    SESSION_PERMANENT=False
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(), logging.FileHandler('app.log', encoding='utf-8')]
 )
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-class DataAnalysisApp:
-    """Core application logic for data analysis functionality"""
+class AppConfig:
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024
+    ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
+    UPLOAD_FOLDER = 'uploads'
+    MAX_CODE_LENGTH = 10000
+
+class GroqCodeAssistant:
     
     def __init__(self):
-        self.supported_formats = {'.csv', '.xlsx', '.xls', '.json'}
-    
-    def validate_file(self, filename: str) -> Tuple[bool, str]:
-        """Validate uploaded file format"""
-        if not filename:
-            return False, "No file selected"
+        self.app = Flask(__name__)
+        self.app.config.from_object(AppConfig)
+        self.app.secret_key = os.getenv('FLASK_SECRET_KEY', 'dev-secret-key')
         
-        file_ext = os.path.splitext(filename)[1].lower()
-        if file_ext not in self.supported_formats:
-            return False, f"Unsupported file format. Supported formats: {', '.join(self.supported_formats)}"
+        os.makedirs(AppConfig.UPLOAD_FOLDER, exist_ok=True)
         
-        return True, ""
+        self.components = self._initialize_components()
+        self._register_handlers()
+        self._register_routes()
     
-    def generate_analysis_code(self, query: str, api_key: str) -> Tuple[Optional[str], Optional[str]]:
-        """Generate Python code for data analysis using Groq API"""
+    def _initialize_components(self):
         try:
-            prompt = f"""
-You are a Python data analyst. Given a pandas DataFrame named `df`, write efficient and safe Python code using pandas to answer this question:
-
-Question: {query}
-
-Requirements:
-1. Return ONLY the Python code without any explanations, markdown, or additional text
-2. Use 'result' as the final output variable
-3. Use pandas best practices and efficient operations
-4. Handle potential errors gracefully
-5. Do not use any operations that could modify the original DataFrame
-
-Code:
-"""
-            client = Groq(api_key=api_key)
-            chat_completion = client.chat.completions.create(
-                messages=[{"role": "user", "content": prompt}],
-                model="llama-3.3-70b-versatile",
-                temperature=0.1,  # Lower temperature for more deterministic code
-                max_tokens=1000
-            )
-            
-            code = chat_completion.choices[0].message.content.strip()
-            # Clean up common formatting issues
-            code = code.removeprefix("```python").removesuffix("```").strip()
-            
-            return code, None
-            
-        except Exception as e:
-            logger.error(f"Groq API error: {str(e)}")
-            return None, f"API Error: {str(e)}"
-    
-    def execute_analysis_code(self, code: str, df: pd.DataFrame) -> Tuple[Any, Optional[str]]:
-        """Safely execute the generated analysis code"""
-        try:
-            # Create a safe execution environment
-            safe_globals = {
-                'pd': pd,
-                'df': df,
-                '__builtins__': {**__builtins__}  # Copy of builtins for safety
+            return {
+                'image_processor': ImageProcessor(),
+                'code_generator': CodeGenerator(),
+                'code_executor': CodeExecutor()
             }
-            
-            # Remove dangerous builtins
-            dangerous_builtins = ['open', 'file', 'exec', 'eval', 'compile', 
-                                '__import__', 'exit', 'quit', 'globals', 'locals']
-            for dangerous in dangerous_builtins:
-                if dangerous in safe_globals['__builtins__']:
-                    del safe_globals['__builtins__'][dangerous]
-            
-            # Execute the code
-            exec(code, safe_globals)
-            
-            # Get the result
-            result = safe_globals.get('result')
-            if result is None:
-                return None, "No result variable found in generated code"
-                
-            return result, None
-            
         except Exception as e:
-            logger.error(f"Code execution error: {str(e)}")
-            return None, f"Execution Error: {str(e)}"
-
-# Initialize the application logic
-analysis_app = DataAnalysisApp()
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    """Main route for the data analysis application"""
-    if request.method == "POST":
-        return handle_post_request()
+            logger.error(f"Component initialization failed: {str(e)}")
+            raise
     
-    return render_template("index.html")
-
-def handle_post_request():
-    """Handle POST request data and process the analysis"""
-    file = request.files.get("file")
-    query = request.form.get("query", "").strip()
-    groq_key = request.form.get("api_key", "").strip()
-    
-    # Validate inputs
-    if not groq_key:
-        flash("Please enter your Groq API key.", "error")
-        return render_template("index.html")
-    
-    if not file or file.filename == "":
-        flash("Please select a file to upload.", "error")
-        return render_template("index.html")
-    
-    # Validate file format
-    is_valid, error_msg = analysis_app.validate_file(file.filename)
-    if not is_valid:
-        flash(error_msg, "error")
-        return render_template("index.html")
-    
-    try:
-        # Process uploaded file
-        df, cols, df_html, err = preprocess_and_save(file)
-        if err:
-            flash(f"Error processing file: {err}", "error")
-            return render_template("index.html")
+    def _register_handlers(self):
         
-        # Store data in session for potential reuse
-        session['df_columns'] = cols
-        session['file_processed'] = True
+        @self.app.errorhandler(404)
+        def not_found(error):
+            return render_template('error.html', error_code=404, error_message="Page not found"), 404
         
-        result_data = {
-            'df_html': df_html,
-            'df_preview_html': df.head().to_html(classes='table table-striped table-bordered', index=False) if df is not None else "",
-            'code_generated': "",
-            'result_html': "",
-            'query_used': query
+        @self.app.errorhandler(500)
+        def internal_error(error):
+            logger.error(f"Internal server error: {str(error)}")
+            return render_template('error.html', error_code=500, error_message="Internal server error"), 500
+        
+        @self.app.errorhandler(RequestEntityTooLarge)
+        def too_large(error):
+            return render_template('error.html', error_code=413, error_message="File too large"), 413
+        
+        @self.app.errorhandler(Exception)
+        def handle_exception(error):
+            logger.error(f"Unhandled exception: {str(error)}")
+            return render_template('error.html', error_code=500, error_message="Unexpected error"), 500
+    
+    def _register_routes(self):
+        
+        @self.app.route("/", methods=["GET", "POST"])
+        def index():
+            return self._handle_index()
+        
+        @self.app.route("/health", methods=["GET"])
+        def health_check():
+            return self._handle_health_check()
+        
+        @self.app.route("/api/process", methods=["POST"])
+        def api_process():
+            return self._handle_api_process()
+        
+        @self.app.route("/history", methods=["GET"])
+        def history():
+            return self._handle_history()
+        
+        @self.app.route("/clear-session", methods=["POST"])
+        def clear_session():
+            session.clear()
+            return jsonify({"success": True, "message": "Session cleared"})
+    
+    def _validate_input(self, query, image_file):
+        if not query and not image_file:
+            return False, "Provide text query or image"
+        
+        if query and image_file:
+            return False, "Use only one input method"
+        
+        if len(query) > 5000:
+            return False, "Query too long"
+        
+        return True, None
+    
+    def _process_image_input(self, image_file):
+        if not self._allowed_file(image_file.filename):
+            return None, "Invalid file type"
+        
+        filename = secure_filename(image_file.filename)
+        temp_path = os.path.join(AppConfig.UPLOAD_FOLDER, f"{uuid.uuid4()}_{filename}")
+        
+        try:
+            image_file.save(temp_path)
+            extracted_text = self.components['image_processor'].extract_text_from_image_file(temp_path)
+            
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            
+            if not extracted_text:
+                return None, "No text extracted from image"
+            
+            return extracted_text, None
+        
+        except Exception as e:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+            logger.error(f"Image processing error: {str(e)}")
+            return None, f"Image processing failed: {str(e)}"
+    
+    def _generate_and_execute_code(self, extracted_text):
+        try:
+            start_time = time.time()
+            generated_code = self.components['code_generator'].generate_python_code(extracted_text)
+            generation_time = time.time() - start_time
+            
+            if not generated_code:
+                return None, None, "Code generation failed"
+            
+            if len(generated_code) > AppConfig.MAX_CODE_LENGTH:
+                return None, None, "Generated code too long"
+            
+            start_time = time.time()
+            execution_result = self.components['code_executor'].execute_code(generated_code)
+            execution_time = time.time() - start_time
+            
+            logger.info(f"Generation: {generation_time:.2f}s, Execution: {execution_time:.2f}s")
+            
+            self._store_in_history(extracted_text, generated_code, execution_result)
+            
+            return generated_code, execution_result, None
+        
+        except Exception as e:
+            logger.error(f"Code processing error: {str(e)}")
+            return None, None, f"Processing failed: {str(e)}"
+    
+    def _store_in_history(self, problem, code, result):
+        if 'history' not in session:
+            session['history'] = []
+        
+        history_entry = {
+            'id': str(uuid.uuid4()),
+            'timestamp': time.time(),
+            'problem': problem[:500] + "..." if len(problem) > 500 else problem,
+            'code_preview': code[:200] + "..." if len(code) > 200 else code,
+            'result_preview': result[:300] + "..." if len(result) > 300 else result
         }
         
-        # Process query if provided
-        if query:
-            result_data.update(process_data_analysis(query, groq_key, df))
+        session['history'].insert(0, history_entry)
+        session['history'] = session['history'][:10]
+        session.modified = True
+    
+    def _handle_index(self):
+        if request.method == "GET":
+            return render_template("index.html")
         
-        return render_template("index.html", **result_data)
+        try:
+            query = request.form.get("query", "").strip()
+            image_file = request.files.get("image")
+            
+            is_valid, error_message = self._validate_input(query, image_file)
+            if not is_valid:
+                return render_template("index.html", error=error_message)
+            
+            if image_file:
+                extracted_text, error_message = self._process_image_input(image_file)
+                if error_message:
+                    return render_template("index.html", error=error_message)
+            else:
+                extracted_text = query
+            
+            generated_code, execution_result, error_message = self._generate_and_execute_code(extracted_text)
+            if error_message:
+                return render_template("index.html", error=error_message)
+            
+            return render_template("index.html",
+                                 extracted=extracted_text,
+                                 solution=generated_code,
+                                 result=execution_result)
         
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        flash(f"An unexpected error occurred: {str(e)}", "error")
-        return render_template("index.html")
-
-def process_data_analysis(query: str, api_key: str, df: pd.DataFrame) -> Dict[str, Any]:
-    """Process data analysis query and return results"""
-    # Generate analysis code
-    code_generated, code_error = analysis_app.generate_analysis_code(query, api_key)
-    if code_error:
-        flash(f"Code generation failed: {code_error}", "error")
-        return {}
+        except Exception as e:
+            logger.error(f"Request processing error: {str(e)}")
+            return render_template("index.html", error=f"Processing error: {str(e)}")
     
-    # Execute the generated code
-    result, exec_error = analysis_app.execute_analysis_code(code_generated, df)
-    if exec_error:
-        flash(f"Code execution failed: {exec_error}", "error")
-        return {'code_generated': code_generated}
+    def _handle_health_check(self):
+        try:
+            components_healthy = all(component is not None for component in self.components.values())
+            
+            status = {
+                "status": "healthy" if components_healthy else "degraded",
+                "service": "Groq Code Assistant",
+                "timestamp": time.time(),
+                "components": {
+                    name: "healthy" if component else "unavailable"
+                    for name, component in self.components.items()
+                }
+            }
+            
+            return jsonify(status), 200 if components_healthy else 503
+        
+        except Exception as e:
+            logger.error(f"Health check error: {str(e)}")
+            return jsonify({"status": "unhealthy", "error": str(e)}), 500
     
-    # Format the result
-    result_html = format_result(result)
+    def _handle_api_process(self):
+        try:
+            data = request.get_json()
+            if not data:
+                return jsonify({"error": "No data provided"}), 400
+            
+            query = data.get('query', '').strip()
+            
+            if not query:
+                return jsonify({"error": "Query required"}), 400
+            
+            generated_code, execution_result, error_message = self._generate_and_execute_code(query)
+            
+            if error_message:
+                return jsonify({"error": error_message}), 400
+            
+            return jsonify({
+                "problem": query,
+                "generated_code": generated_code,
+                "execution_result": execution_result,
+                "success": True
+            })
+        
+        except Exception as e:
+            logger.error(f"API error: {str(e)}")
+            return jsonify({"error": str(e)}), 500
     
-    return {
-        'code_generated': code_generated,
-        'result_html': result_html
-    }
+    def _handle_history(self):
+        history = session.get('history', [])
+        return render_template("history.html", history=history)
+    
+    def _allowed_file(self, filename):
+        return '.' in filename and filename.rsplit('.', 1)[1].lower() in AppConfig.ALLOWED_EXTENSIONS
+    
+    def run(self):
+        debug_mode = os.getenv("FLASK_DEBUG", "False").lower() == "true"
+        host = os.getenv("FLASK_HOST", "0.0.0.0")
+        port = int(os.getenv("FLASK_PORT", "5000"))
+        
+        logger.info(f"Starting app on {host}:{port}")
+        
+        self.app.run(debug=debug_mode, host=host, port=port)
 
-def format_result(result: Any) -> str:
-    """Format the analysis result as HTML"""
-    try:
-        if isinstance(result, pd.DataFrame):
-            return result.to_html(
-                classes='table table-striped table-bordered', 
-                index=False,
-                escape=False
-            )
-        elif isinstance(result, pd.Series):
-            return result.to_frame().to_html(
-                classes='table table-striped table-bordered',
-                index=True,
-                escape=False
-            )
-        else:
-            # For scalar results or other types
-            return f"""
-            <div class="alert alert-info">
-                <h5>Result:</h5>
-                <pre>{str(result)}</pre>
-            </div>
-            """
-    except Exception as e:
-        logger.error(f"Error formatting result: {str(e)}")
-        return f"<div class='alert alert-danger'>Error formatting result: {str(e)}</div>"
-
-@app.errorhandler(413)
-def too_large(e):
-    """Handle file too large error"""
-    flash("File too large. Maximum size is 16MB.", "error")
-    return redirect(url_for('index'))
-
-@app.errorhandler(500)
-def internal_error(e):
-    """Handle internal server errors"""
-    logger.error(f"Internal server error: {str(e)}")
-    flash("An internal server error occurred. Please try again.", "error")
-    return redirect(url_for('index'))
+def create_app():
+    return GroqCodeAssistant().app
 
 if __name__ == "__main__":
-    # Use environment variable for port and debug mode
-    port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
-    
-    app.run(
-        host="0.0.0.0", 
-        port=port, 
-        debug=debug
-    )
+    assistant = GroqCodeAssistant()
+    assistant.run()
