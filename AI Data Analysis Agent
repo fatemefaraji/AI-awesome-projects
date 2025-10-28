@@ -5,29 +5,30 @@ import os
 import logging
 from typing import Tuple, Optional, Dict, Any
 import io
+import json
 from utils import preprocess_and_save
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-key-please-change")
 
-# Configuration
 app.config.update(
-    MAX_CONTENT_LENGTH=16 * 1024 * 1024,  # 16MB max file size
+    MAX_CONTENT_LENGTH=16 * 1024 * 1024,
     SESSION_PERMANENT=False
 )
 
-# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class DataAnalysisApp:
-    """Core application logic for data analysis functionality"""
     
     def __init__(self):
         self.supported_formats = {'.csv', '.xlsx', '.xls', '.json'}
+        self.safe_builtins = {
+            'len', 'str', 'int', 'float', 'bool', 'list', 'dict', 'set', 'tuple',
+            'sum', 'max', 'min', 'abs', 'round', 'zip', 'range', 'enumerate'
+        }
     
     def validate_file(self, filename: str) -> Tuple[bool, str]:
-        """Validate uploaded file format"""
         if not filename:
             return False, "No file selected"
         
@@ -37,13 +38,17 @@ class DataAnalysisApp:
         
         return True, ""
     
-    def generate_analysis_code(self, query: str, api_key: str) -> Tuple[Optional[str], Optional[str]]:
-        """Generate Python code for data analysis using Groq API"""
+    def generate_analysis_code(self, query: str, api_key: str, df_columns: list = None) -> Tuple[Optional[str], Optional[str]]:
         try:
+            columns_context = ""
+            if df_columns:
+                columns_context = f"\nAvailable columns: {', '.join(df_columns)}"
+            
             prompt = f"""
 You are a Python data analyst. Given a pandas DataFrame named `df`, write efficient and safe Python code using pandas to answer this question:
 
 Question: {query}
+{columns_context}
 
 Requirements:
 1. Return ONLY the Python code without any explanations, markdown, or additional text
@@ -51,6 +56,7 @@ Requirements:
 3. Use pandas best practices and efficient operations
 4. Handle potential errors gracefully
 5. Do not use any operations that could modify the original DataFrame
+6. Focus on data analysis operations like filtering, grouping, aggregation, and statistical analysis
 
 Code:
 """
@@ -58,12 +64,11 @@ Code:
             chat_completion = client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
                 model="llama-3.3-70b-versatile",
-                temperature=0.1,  # Lower temperature for more deterministic code
-                max_tokens=1000
+                temperature=0.1,
+                max_tokens=1500
             )
             
             code = chat_completion.choices[0].message.content.strip()
-            # Clean up common formatting issues
             code = code.removeprefix("```python").removesuffix("```").strip()
             
             return code, None
@@ -72,27 +77,26 @@ Code:
             logger.error(f"Groq API error: {str(e)}")
             return None, f"API Error: {str(e)}"
     
+    def create_safe_environment(self, df: pd.DataFrame) -> dict:
+        safe_pd = pd
+        safe_globals = {
+            'pd': safe_pd,
+            'df': df,
+            'result': None
+        }
+        
+        restricted_builtins = {name: func for name, func in __builtins__.items() 
+                              if name in self.safe_builtins}
+        safe_globals['__builtins__'] = restricted_builtins
+        
+        return safe_globals
+    
     def execute_analysis_code(self, code: str, df: pd.DataFrame) -> Tuple[Any, Optional[str]]:
-        """Safely execute the generated analysis code"""
         try:
-            # Create a safe execution environment
-            safe_globals = {
-                'pd': pd,
-                'df': df,
-                '__builtins__': {**__builtins__}  # Copy of builtins for safety
-            }
+            safe_globals = self.create_safe_environment(df)
             
-            # Remove dangerous builtins
-            dangerous_builtins = ['open', 'file', 'exec', 'eval', 'compile', 
-                                '__import__', 'exit', 'quit', 'globals', 'locals']
-            for dangerous in dangerous_builtins:
-                if dangerous in safe_globals['__builtins__']:
-                    del safe_globals['__builtins__'][dangerous]
-            
-            # Execute the code
             exec(code, safe_globals)
             
-            # Get the result
             result = safe_globals.get('result')
             if result is None:
                 return None, "No result variable found in generated code"
@@ -103,24 +107,30 @@ Code:
             logger.error(f"Code execution error: {str(e)}")
             return None, f"Execution Error: {str(e)}"
 
-# Initialize the application logic
 analysis_app = DataAnalysisApp()
 
 @app.route("/", methods=["GET", "POST"])
 def index():
-    """Main route for the data analysis application"""
     if request.method == "POST":
         return handle_post_request()
     
-    return render_template("index.html")
+    session_data = {
+        'file_processed': session.get('file_processed', False),
+        'df_columns': session.get('df_columns', [])
+    }
+    return render_template("index.html", **session_data)
+
+@app.route("/clear", methods=["POST"])
+def clear_session():
+    session.clear()
+    flash("Session cleared successfully.", "success")
+    return redirect(url_for('index'))
 
 def handle_post_request():
-    """Handle POST request data and process the analysis"""
     file = request.files.get("file")
     query = request.form.get("query", "").strip()
     groq_key = request.form.get("api_key", "").strip()
     
-    # Validate inputs
     if not groq_key:
         flash("Please enter your Groq API key.", "error")
         return render_template("index.html")
@@ -129,34 +139,33 @@ def handle_post_request():
         flash("Please select a file to upload.", "error")
         return render_template("index.html")
     
-    # Validate file format
     is_valid, error_msg = analysis_app.validate_file(file.filename)
     if not is_valid:
         flash(error_msg, "error")
         return render_template("index.html")
     
     try:
-        # Process uploaded file
         df, cols, df_html, err = preprocess_and_save(file)
         if err:
             flash(f"Error processing file: {err}", "error")
             return render_template("index.html")
         
-        # Store data in session for potential reuse
         session['df_columns'] = cols
         session['file_processed'] = True
+        session['df_preview'] = df.head(10).to_dict('records')
         
         result_data = {
             'df_html': df_html,
-            'df_preview_html': df.head().to_html(classes='table table-striped table-bordered', index=False) if df is not None else "",
+            'df_preview_html': df.head().to_html(classes='table table-striped table-bordered', index=False),
             'code_generated': "",
             'result_html': "",
-            'query_used': query
+            'query_used': query,
+            'file_processed': True,
+            'df_columns': cols
         }
         
-        # Process query if provided
         if query:
-            result_data.update(process_data_analysis(query, groq_key, df))
+            result_data.update(process_data_analysis(query, groq_key, df, cols))
         
         return render_template("index.html", **result_data)
         
@@ -165,21 +174,17 @@ def handle_post_request():
         flash(f"An unexpected error occurred: {str(e)}", "error")
         return render_template("index.html")
 
-def process_data_analysis(query: str, api_key: str, df: pd.DataFrame) -> Dict[str, Any]:
-    """Process data analysis query and return results"""
-    # Generate analysis code
-    code_generated, code_error = analysis_app.generate_analysis_code(query, api_key)
+def process_data_analysis(query: str, api_key: str, df: pd.DataFrame, df_columns: list) -> Dict[str, Any]:
+    code_generated, code_error = analysis_app.generate_analysis_code(query, api_key, df_columns)
     if code_error:
         flash(f"Code generation failed: {code_error}", "error")
         return {}
     
-    # Execute the generated code
     result, exec_error = analysis_app.execute_analysis_code(code_generated, df)
     if exec_error:
         flash(f"Code execution failed: {exec_error}", "error")
         return {'code_generated': code_generated}
     
-    # Format the result
     result_html = format_result(result)
     
     return {
@@ -188,22 +193,31 @@ def process_data_analysis(query: str, api_key: str, df: pd.DataFrame) -> Dict[st
     }
 
 def format_result(result: Any) -> str:
-    """Format the analysis result as HTML"""
     try:
         if isinstance(result, pd.DataFrame):
+            if result.empty:
+                return "<div class='alert alert-warning'>The result is an empty DataFrame.</div>"
             return result.to_html(
-                classes='table table-striped table-bordered', 
+                classes='table table-striped table-bordered table-hover', 
                 index=False,
                 escape=False
             )
         elif isinstance(result, pd.Series):
+            if result.empty:
+                return "<div class='alert alert-warning'>The result is an empty Series.</div>"
             return result.to_frame().to_html(
-                classes='table table-striped table-bordered',
+                classes='table table-striped table-bordered table-hover',
                 index=True,
                 escape=False
             )
+        elif isinstance(result, (int, float, str, bool)):
+            return f"""
+            <div class="alert alert-success">
+                <h5>Analysis Result:</h5>
+                <div class="result-value">{result}</div>
+            </div>
+            """
         else:
-            # For scalar results or other types
             return f"""
             <div class="alert alert-info">
                 <h5>Result:</h5>
@@ -216,19 +230,16 @@ def format_result(result: Any) -> str:
 
 @app.errorhandler(413)
 def too_large(e):
-    """Handle file too large error"""
     flash("File too large. Maximum size is 16MB.", "error")
     return redirect(url_for('index'))
 
 @app.errorhandler(500)
 def internal_error(e):
-    """Handle internal server errors"""
     logger.error(f"Internal server error: {str(e)}")
     flash("An internal server error occurred. Please try again.", "error")
     return redirect(url_for('index'))
 
 if __name__ == "__main__":
-    # Use environment variable for port and debug mode
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "False").lower() == "true"
     
